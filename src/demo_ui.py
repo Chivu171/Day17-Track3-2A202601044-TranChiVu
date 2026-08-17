@@ -89,26 +89,67 @@ def retrieve_for_case(
     case: dict[str, Any],
     extra_messages: list[dict[str, str]],
 ) -> dict[str, Any]:
-    """BONUS TODO: run student retrieval for the loaded case.
+    """Run student memory retrieval for the loaded test case.
 
-    Return a dict with keys:
+    Returns a dict with keys:
       - "merged_context": str  (StudentMemory.assemble_context output)
       - "layers": dict[str, str]  (per-layer evidence: short_term/long_term/
                                    episodic/semantic)
       - "budget": dict  (the breakdown from assemble_context)
 
-    Hints:
-      * Build short_term from case["fixture_messages"] if present, else from
-        the matching user/thread messages in data/sessions.json, plus
-        extra_messages. E01 has no fixture — it uses thread minh-s1.
-      * Decide which durable layers to fetch from case["expected_layer"] (or
-        case["retrieve_layers"] for "mixed"), then call
-        memory.retrieve_long_term / retrieve_episodic / retrieve_semantic.
-      * Keep user_id and thread_id from the loaded case.
-      * Finish with memory.assemble_context(layers).
+    Builds short_term from case["fixture_messages"] if present (E01/E10),
+    else from matching user/thread messages in data/sessions.json, plus
+    extra_messages from the live chat history. Falls back to long_term for
+    cases where expected_layer is short_term and no fixture exists.
     """
-    _ = (memory, case, extra_messages, settings, ShortTermMemory)
-    raise NotImplementedError("BONUS TODO: run student retrieval for the loaded case")
+    layers: dict[str, str] = {
+        "short_term": "",
+        "long_term": "",
+        "episodic": "",
+        "semantic": "",
+    }
+
+    expected_layer = case.get("expected_layer", "long_term")
+    wanted = case.get("retrieve_layers") or [
+        layer for layer in ("short_term", "long_term", "episodic", "semantic")
+        if layer != "short_term"
+    ]
+
+    # --- Short-term (local, from fixture or dataset) ---
+    if expected_layer == "short_term" or "short_term" in wanted:
+        messages = case.get("fixture_messages") or []
+        if not messages:
+            user = find_user(load_dataset(), case["user_id"])
+            session = find_session(user, case.get("thread_id", ""))
+            messages = (session or {}).get("messages", [])
+        messages = list(messages) + list(extra_messages)
+        stm = ShortTermMemory(
+            strategy="sliding",
+            max_recent_messages=6,
+            pressure_tokens=450,
+        )
+        for msg in messages:
+            stm.add(msg["role"], msg["content"])
+        layers["short_term"] = stm.render()
+
+    # --- Long-term (Zep Context Block) ---
+    if expected_layer == "long_term" or "long_term" in wanted:
+        layers["long_term"] = memory.retrieve_long_term(
+            case["user_id"], case.get("thread_id", ""), case["query"]
+        )
+
+    # --- Episodic (Zep user graph search) ---
+    if expected_layer == "episodic" or "episodic" in wanted:
+        layers["episodic"] = memory.retrieve_episodic(case["user_id"], case["query"])
+
+    # --- Semantic (Zep standalone graph search) ---
+    if expected_layer == "semantic" or "semantic" in wanted:
+        layers["semantic"] = memory.retrieve_semantic(
+            settings.semantic_graph_id, case["query"]
+        )
+
+    merged, budget = memory.assemble_context(layers)
+    return {"merged_context": merged, "layers": layers, "budget": budget}
 
 
 def main() -> None:
